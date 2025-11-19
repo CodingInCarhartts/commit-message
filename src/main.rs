@@ -9,6 +9,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // Configuration
+    let min_length: usize = std::env::var("COMMIT_MSG_MIN_LENGTH").unwrap_or_else(|_| "20".to_string()).parse().unwrap_or(20);
+
     // Get commit history
     let history = get_commit_history()?;
     println!("Commit history:\n{}", history);
@@ -18,7 +21,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Staged files:\n{}", staged);
 
     // Generate commit message using Gemini
-    let message = generate_commit_message(&history, &staged).await?;
+    let mut message = generate_commit_message(&history, &staged).await?;
+    let mut attempts = 1;
+    while !validate_commit_message(&message, min_length) && attempts < 3 {
+        eprintln!("Generated message failed quality check, regenerating... (attempt {})", attempts + 1);
+        message = generate_commit_message(&history, &staged).await?;
+        attempts += 1;
+    }
+    if !validate_commit_message(&message, min_length) {
+        eprintln!("Failed to generate a quality commit message after {} attempts. Please check your staged changes or try again.", attempts);
+        return Ok(());
+    }
     println!("Generated message: {}", message);
 
     // Commit
@@ -72,8 +85,8 @@ async fn generate_commit_message(history: &str, staged: &str) -> Result<String, 
     let url = format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key={}", api_key);
 
     let prompt = format!(
-        "Based on the following Conventional Commits specification and the provided git commit history and staged changes, generate a single commit message that follows the specification exactly.\n\nConventional Commits Specification:\n{}\n\nCommit History:\n{}\n\nStaged Changes:\n{}\n\nGenerate only the commit message, nothing else.",
-        include_str!("../conventional_commits.txt"), // Wait, need to create this file
+        "Based on the following Conventional Commits specification and the provided git commit history and staged changes, generate a single, high-quality commit message that follows the specification exactly.\n\nKey requirements for the commit message:\n- Strictly follow Conventional Commits format: type(scope): description\n- Include a scope in parentheses if the change affects a specific component (e.g., feat(auth): add login validation)\n- Provide a detailed, specific description that explains what changed and why, avoiding generic terms like 'update' or 'fix issue'\n- Ensure the message is informative and provides context for future developers\n- Keep the description concise but meaningful (aim for 50-100 characters)\n- If the change is a breaking change, mark it with ! and include BREAKING CHANGE in the body if needed\n\nConventional Commits Specification:\n{}\n\nRecent Commit History (for style and context):\n{}\n\nStaged Changes (analyze these to understand what was modified):\n{}\n\nGenerate only the commit message, nothing else. Make it detailed and professional.",
+        include_str!("../conventional_commits.txt"),
         history,
         staged
     );
@@ -100,6 +113,48 @@ async fn generate_commit_message(history: &str, staged: &str) -> Result<String, 
         .to_string();
 
     Ok(message)
+}
+
+fn validate_commit_message(message: &str, min_length: usize) -> bool {
+    // Check minimum length for meaningful messages
+    if message.len() < min_length {
+        return false;
+    }
+
+    // Check conventional commits format: type(scope): description
+    let types = ["feat", "fix", "docs", "style", "refactor", "test", "chore", "perf", "ci", "build", "revert"];
+    let mut valid = false;
+    for t in &types {
+        if message.starts_with(&format!("{}: ", t)) || message.starts_with(&format!("{}!", t)) {
+            valid = true;
+            break;
+        }
+        // Check for scope
+        if let Some(colon_pos) = message.find(':') {
+            let prefix = &message[..colon_pos];
+            if prefix.starts_with(&format!("{}(", t)) && prefix.ends_with(')') {
+                valid = true;
+                break;
+            }
+            if prefix.starts_with(&format!("{}!(", t)) && prefix.ends_with(')') && prefix.contains('!') {
+                valid = true;
+                break;
+            }
+        }
+    }
+    if !valid {
+        return false;
+    }
+
+    // Check for generic terms that indicate low quality
+    let generic_terms = ["update", "fix issue", "change", "modify", "improve"];
+    for term in &generic_terms {
+        if message.to_lowercase().contains(term) && message.len() < 50 {
+            return false; // If short and contains generic term, likely low quality
+        }
+    }
+
+    true
 }
 
 fn commit(message: &str) -> Result<(), Box<dyn std::error::Error>> {
