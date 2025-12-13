@@ -1,192 +1,239 @@
-use std::process::Command;
+mod config;
+mod provider;
+mod git;
+mod emoji;
+mod message;
+mod prompt;
+mod ui;
+
+use config::Config;
+use provider::create_provider;
+use git::{is_git_repo, get_commit_history, get_staged_diff, get_diff_stat, count_staged_files, commit, push, GitError};
+use emoji::{add_emoji_prefix, remove_emoji_prefix};
+use message::CommitMessage;
+use prompt::build_commit_prompt;
+use ui::{display_commit_message, UserAction};
 use std::io::{self, Write};
+use std::process;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Check if in git repo
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("❌ Error: {}", e);
+        process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Verify we're in a git repository
     if !is_git_repo() {
-        eprintln!("Not in a git repository");
-        return Ok(());
+        return Err("Not in a git repository. Please run this command from within a git repository.".into());
     }
 
-    // Configuration
-    let min_length: usize = std::env::var("COMMIT_MSG_MIN_LENGTH").unwrap_or_else(|_| "20".to_string()).parse().unwrap_or(20);
+    // Load configuration
+    let config = Config::from_env()?;
 
-    // Get commit history
-    let history = get_commit_history()?;
-    println!("Commit history:\n{}", history);
+    // Get git context
+    let commit_history = get_commit_history(10).unwrap_or_default();
 
-    // Get staged files
-    let staged = get_staged_files()?;
-    println!("Staged files:\n{}", staged);
+    let staged_diff = match get_staged_diff(config.max_diff_lines) {
+        Ok(diff) => diff,
+        Err(GitError::NoStagedChanges) => {
+            return Err("No staged changes. Use 'git add <files>' to stage changes first.".into());
+        }
+        Err(e) => return Err(e.into()),
+    };
 
-    // Generate commit message using Gemini
-    let mut message = generate_commit_message(&history, &staged).await?;
-    let mut attempts = 1;
-    while !validate_commit_message(&message, min_length) && attempts < 3 {
-        eprintln!("Generated message failed quality check, regenerating... (attempt {})", attempts + 1);
-        message = generate_commit_message(&history, &staged).await?;
+    let diff_stat = get_diff_stat();
+    let file_count = count_staged_files();
+
+    // Create AI provider
+    let provider = create_provider(&config);
+    println!("🚀 Using {} ({})", provider.name(), provider.model());
+    println!("📁 {} file(s) changed", file_count);
+
+    // Build prompt
+    let prompt_text = build_commit_prompt(&staged_diff, &commit_history, &diff_stat);
+
+    // Main interaction loop
+    let mut attempts = 0u32;
+
+    loop {
         attempts += 1;
-    }
-    if !validate_commit_message(&message, min_length) {
-        eprintln!("Failed to generate a quality commit message after {} attempts. Please check your staged changes or try again.", attempts);
-        return Ok(());
-    }
-    println!("Generated message: {}", message);
 
-    // Commit
-    commit(&message)?;
+        if attempts > config.max_retries {
+            return Err(format!(
+                "Failed to generate a valid commit message after {} attempts",
+                config.max_retries
+            ).into());
+        }
 
-    // Ask to push
-    if ask_push()? {
-        push()?;
+        // Generate message
+        println!("\n⏳ Generating commit message (attempt {})...", attempts);
+
+        let response = match provider.generate(&prompt_text).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("⚠️  API error: {}. Retrying...", e);
+                continue;
+            }
+        };
+
+        // Parse response
+        let mut commit_msg = CommitMessage::parse_from_ai_response(&response);
+
+        // Apply emoji prefix if enabled
+        if config.emoji_enabled {
+            commit_msg.subject = add_emoji_prefix(&commit_msg.subject);
+        }
+
+        // Display the message with iocraft
+        display_commit_message(
+            &commit_msg.subject,
+            commit_msg.body.as_deref(),
+            provider.name(),
+            provider.model(),
+        );
+
+        // Get user choice
+        let action = prompt_action()?;
+
+        match action {
+            UserAction::Accept => {
+                let git_message = commit_msg.to_git_message();
+                println!("\n⏳ Committing...");
+                commit(&git_message)?;
+                println!("✓ Committed successfully!");
+
+                // Ask about push
+                if ask_push()? {
+                    println!("⏳ Pushing...");
+                    push()?;
+                    println!("✓ Pushed successfully!");
+                }
+
+                break;
+            }
+            UserAction::Edit => {
+                let display = commit_msg.to_git_message();
+                // Remove emoji for editing (will be re-added after)
+                let for_edit = if config.emoji_enabled {
+                    let mut lines: Vec<&str> = display.lines().collect();
+                    if let Some(first) = lines.first_mut() {
+                        let stripped = remove_emoji_prefix(first);
+                        let mut result = vec![stripped];
+                        result.extend(lines.into_iter().skip(1).map(String::from));
+                        result.join("\n")
+                    } else {
+                        display
+                    }
+                } else {
+                    display
+                };
+
+                let edited = edit_message(&for_edit)?;
+
+                if edited.trim().is_empty() {
+                    println!("⚠️  Empty message, aborting commit");
+                    return Ok(());
+                }
+
+                // Re-add emoji if enabled
+                let final_message = if config.emoji_enabled {
+                    let mut lines: Vec<String> = edited.lines().map(String::from).collect();
+                    if let Some(first) = lines.first_mut() {
+                        *first = add_emoji_prefix(first);
+                    }
+                    lines.join("\n")
+                } else {
+                    edited
+                };
+
+                println!("\n⏳ Committing...");
+                commit(&final_message)?;
+                println!("✓ Committed successfully!");
+
+                if ask_push()? {
+                    println!("⏳ Pushing...");
+                    push()?;
+                    println!("✓ Pushed successfully!");
+                }
+
+                break;
+            }
+            UserAction::Regenerate => {
+                println!("🔄 Regenerating...");
+                attempts = 0; // Reset attempts for regeneration
+                continue;
+            }
+            UserAction::Quit => {
+                println!("👋 Aborted");
+                return Ok(());
+            }
+        }
     }
 
     Ok(())
 }
 
-fn is_git_repo() -> bool {
-    Command::new("git")
-        .arg("rev-parse")
-        .arg("--git-dir")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-fn get_commit_history() -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("git")
-        .arg("log")
-        .arg("--oneline")
-        .arg("-10")
-        .output()?;
-    if output.status.success() {
-        Ok(String::from_utf8(output.stdout)?)
-    } else {
-        Err("Failed to get commit history".into())
-    }
-}
-
-fn get_staged_files() -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("git")
-        .arg("diff")
-        .arg("--cached")
-        .arg("--name-status")
-        .output()?;
-    if output.status.success() {
-        Ok(String::from_utf8(output.stdout)?)
-    } else {
-        Err("Failed to get staged files".into())
-    }
-}
-
-async fn generate_commit_message(history: &str, staged: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let url = format!("https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key={}", api_key);
-
-    let prompt = format!(
-        "Based on the following Conventional Commits specification and the provided git commit history and staged changes, generate a single, high-quality commit message that follows the specification exactly.\n\nKey requirements for the commit message:\n- Strictly follow Conventional Commits format: type(scope): description\n- Include a scope in parentheses if the change affects a specific component (e.g., feat(auth): add login validation)\n- Provide a detailed, specific description that explains what changed and why, avoiding generic terms like 'update' or 'fix issue'\n- Ensure the message is informative and provides context for future developers\n- Keep the description concise but meaningful (aim for 50-100 characters)\n- If the change is a breaking change, mark it with ! and include BREAKING CHANGE in the body if needed\n\nConventional Commits Specification:\n{}\n\nRecent Commit History (for style and context):\n{}\n\nStaged Changes (analyze these to understand what was modified):\n{}\n\nGenerate only the commit message, nothing else. Make it detailed and professional.",
-        include_str!("../conventional_commits.txt"),
-        history,
-        staged
+fn prompt_action() -> io::Result<UserAction> {
+    println!();
+    print!(
+        "  {}  {}  {}  {} : ",
+        "\x1b[32m[A]ccept\x1b[0m",
+        "\x1b[33m[E]dit\x1b[0m",
+        "\x1b[36m[R]egenerate\x1b[0m",
+        "\x1b[31m[Q]uit\x1b[0m"
     );
-
-    let body = serde_json::json!({
-        "contents": [{
-            "parts": [{
-                "text": prompt
-            }]
-        }]
-    });
-
-    let client = reqwest::Client::new();
-    let response = client.post(&url)
-        .json(&body)
-        .send()
-        .await?;
-
-    let json: serde_json::Value = response.json().await?;
-    let message = json["candidates"][0]["content"]["parts"][0]["text"]
-        .as_str()
-        .ok_or("Failed to parse response")?
-        .trim()
-        .to_string();
-
-    Ok(message)
-}
-
-fn validate_commit_message(message: &str, min_length: usize) -> bool {
-    // Check minimum length for meaningful messages
-    if message.len() < min_length {
-        return false;
-    }
-
-    // Check conventional commits format: type(scope): description
-    let types = ["feat", "fix", "docs", "style", "refactor", "test", "chore", "perf", "ci", "build", "revert"];
-    let mut valid = false;
-    for t in &types {
-        if message.starts_with(&format!("{}: ", t)) || message.starts_with(&format!("{}!", t)) {
-            valid = true;
-            break;
-        }
-        // Check for scope
-        if let Some(colon_pos) = message.find(':') {
-            let prefix = &message[..colon_pos];
-            if prefix.starts_with(&format!("{}(", t)) && prefix.ends_with(')') {
-                valid = true;
-                break;
-            }
-            if prefix.starts_with(&format!("{}!(", t)) && prefix.ends_with(')') && prefix.contains('!') {
-                valid = true;
-                break;
-            }
-        }
-    }
-    if !valid {
-        return false;
-    }
-
-    // Check for generic terms that indicate low quality
-    let generic_terms = ["update", "fix issue", "change", "modify", "improve"];
-    for term in &generic_terms {
-        if message.to_lowercase().contains(term) && message.len() < 50 {
-            return false; // If short and contains generic term, likely low quality
-        }
-    }
-
-    true
-}
-
-fn commit(message: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let status = Command::new("git")
-        .arg("commit")
-        .arg("-m")
-        .arg(message)
-        .status()?;
-    if status.success() {
-        println!("Committed successfully");
-        Ok(())
-    } else {
-        Err("Commit failed".into())
-    }
-}
-
-fn ask_push() -> Result<bool, Box<dyn std::error::Error>> {
-    print!("Do you want to push? (y/n): ");
     io::stdout().flush()?;
+
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
+
+    match input.trim().to_lowercase().chars().next() {
+        Some('a') | Some('y') => Ok(UserAction::Accept),
+        Some('e') => Ok(UserAction::Edit),
+        Some('r') => Ok(UserAction::Regenerate),
+        Some('q') | Some('n') => Ok(UserAction::Quit),
+        _ => {
+            println!("Invalid choice. Please enter A, E, R, or Q.");
+            prompt_action()
+        }
+    }
+}
+
+fn ask_push() -> io::Result<bool> {
+    print!("\n🔼 Push to remote? [y/N]: ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
     Ok(input.trim().to_lowercase() == "y")
 }
 
-fn push() -> Result<(), Box<dyn std::error::Error>> {
-    let status = Command::new("git")
-        .arg("push")
-        .status()?;
-    if status.success() {
-        println!("Pushed successfully");
-        Ok(())
-    } else {
-        Err("Push failed".into())
+fn edit_message(message: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use std::fs;
+    use std::env;
+    use std::process::Command;
+
+    let path = env::temp_dir().join(".cm_commit_msg_edit");
+    fs::write(&path, message)?;
+
+    let editor = env::var("EDITOR")
+        .or_else(|_| env::var("VISUAL"))
+        .unwrap_or_else(|_| "nano".to_string());
+
+    println!("📝 Opening {}...", editor);
+
+    let status = Command::new(&editor).arg(&path).status()?;
+
+    if !status.success() {
+        return Err(format!("Editor '{}' exited with error", editor).into());
     }
+
+    let edited = fs::read_to_string(&path)?;
+    let _ = fs::remove_file(&path);
+
+    Ok(edited.trim().to_string())
 }

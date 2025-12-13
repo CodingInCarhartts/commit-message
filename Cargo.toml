@@ -1,10 +1,27 @@
 [package]
 name = "cm"
-version = "0.1.0"
-edition = "2024"
+version = "0.2.0"
+edition = "2021"
+description = "AI-powered conventional commit message generator"
+license = "MIT"
+repository = "https://github.com/CodingInCarhartts/commit-message"
+keywords = ["git", "commit", "ai", "conventional-commits"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
+# Async runtime
 tokio = { version = "1", features = ["full"] }
+smol = "2"
+
+# HTTP client
 reqwest = { version = "0.11", features = ["json"] }
+
+# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# Async traits
+async-trait = "0.1"
+
+# Terminal UI
+iocraft = "0.7"
